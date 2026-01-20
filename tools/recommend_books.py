@@ -6,6 +6,14 @@ Purpose:
 
 Note:
 - Uses simple intent parsing + scoring against `storedata.json`.
+
+How to think about this tool
+----------------------------
+This is intentionally **not** an embedding search or vector DB.
+Instead it demonstrates a very common early-stage pattern:
+- parse preferences from a natural-language request
+- score each candidate in your structured dataset
+- return a small ranked list with human-readable reasons
 """
 
 from __future__ import annotations
@@ -82,6 +90,8 @@ _STOPWORDS = {
 
 @dataclass(frozen=True)
 class _Prefs:
+    # Parsed user preferences (all optional except count).
+    # Keeping them in one dataclass makes it easy to pass around and test.
     count: int
     genres: tuple[str, ...]
     authors: tuple[str, ...]
@@ -99,6 +109,7 @@ class _Prefs:
 
 
 def _unique_genres() -> list[str]:
+    # Harvest genres from the inventory so we can detect them in user requests.
     seen: set[str] = set()
     out: list[str] = []
     for b in load_store_books():
@@ -114,6 +125,7 @@ def _unique_genres() -> list[str]:
 
 
 def _extract_count(user_request: str) -> int:
+    # How many recs did the user ask for? Default to 2.
     q = user_request.lower()
     # Prefer explicit "N books" / "N suggestions" / "top N" (avoid decimals like 4.7 stars)
     m = re.search(
@@ -132,6 +144,8 @@ def _extract_count(user_request: str) -> int:
 
 
 def _extract_price_bounds(user_request: str) -> tuple[float | None, float | None]:
+    # Lightweight parsing of money cues. We only treat bare numbers as money
+    # when the user also used a currency cue (e.g. "$", "dollars").
     q = user_request.lower()
     has_money_cue = ("$" in q) or any(k in q for k in ["dollar", "dollars", "usd", "bucks", "£", "€"])
     # between $x and $y
@@ -262,6 +276,8 @@ def _extract_authors(user_request: str, books: list[BookView]) -> tuple[str, ...
 
 
 def _extract_genres_and_keywords(user_request: str, known_genres: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    # Step 1: detect explicit genres (from inventory) mentioned in the request.
+    # Step 2: extract a few "keywords" to match against title/author/description.
     qn = norm(user_request)
 
     # Genre synonyms / common phrases
@@ -342,6 +358,15 @@ def _review_percentiles(books: list[BookView]) -> dict[str, float]:
 
 
 def _score_book(b: BookView, prefs: _Prefs, *, review_percentile: float | None) -> tuple[float, list[str]]:
+    """
+    Score one book against preferences.
+
+    Returns:
+    - a numeric score (higher is better)
+    - short reason fragments (used to justify recommendations)
+
+    This is deliberately heuristic (weights are hand-tuned) so it's easy to understand.
+    """
     score = 0.0
     reasons: list[str] = []
 
@@ -463,6 +488,7 @@ def _opening_commentary(prefs: _Prefs, user_request: str) -> str:
 
 
 def _format_reco(b: BookView, *, prefs: _Prefs, user_request: str) -> str:
+    # Format one recommendation as a short, skimmable paragraph.
     # 1 short descriptive sentence (avoid overly long descriptions)
     desc = b.description.strip()
     if desc and len(desc) > 160:
@@ -532,7 +558,22 @@ def _format_reco(b: BookView, *, prefs: _Prefs, user_request: str) -> str:
 
 @tool
 def recommend_books(user_request: str) -> str:
-    """Recommend books based on user preferences."""
+    """
+    Recommend books based on user preferences.
+
+    Input contract
+    --------------
+    - `user_request`: the user's natural language request (genres, constraints, vibes).
+
+    Output contract
+    ---------------
+    - A multi-line string with an opener + N formatted recommendations.
+
+    Calling convention
+    ------------------
+    This is a LangChain tool, so in Python it is invoked like:
+    - `recommend_books.invoke({"user_request": "..."})`
+    """
     books = [book_view(b) for b in load_store_books()]
     if not books:
         return "I can't load the inventory right now, I'm afraid."
@@ -577,7 +618,8 @@ def recommend_books(user_request: str) -> str:
         return pref_genre in txt
 
     def _meets_constraints_strict(b: BookView) -> bool:
-        # Only enforce constraints the user actually specified.
+        # "Strict" means: only include books that satisfy every explicit constraint the user stated.
+        # If this yields too few candidates, we fall back to a softer approach (see below).
         if prefs.on_sale is True and not b.on_sale:
             return False
         if prefs.max_price is not None:
@@ -624,13 +666,14 @@ def recommend_books(user_request: str) -> str:
     if len(strict_matches) >= prefs.count:
         candidate_books = strict_matches
     else:
-        # Fallback strategy: if the user named a genre, keep that anchor and relax other constraints first.
+        # Fallback strategy: if we don't have enough strict matches, we keep the strongest signal
+        # (genre, if mentioned) and relax other constraints first.
         if prefs.genres:
             genre_anchor = [b for b in books if any(_genre_match(b, g) for g in prefs.genres)]
             candidate_books = genre_anchor if genre_anchor else books
         else:
             candidate_books = books
-    # Apply "hard when possible" filters so explicit constraints feel reliable.
+    # Apply "hard when possible" filters: try to honor explicit constraints without producing 0 results.
     if prefs.on_sale is True:
         candidate_books = _soft_filter(candidate_books, [b for b in candidate_books if b.on_sale])
     if prefs.max_price is not None:

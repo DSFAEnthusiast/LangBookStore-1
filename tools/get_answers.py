@@ -1,16 +1,24 @@
 """
-GetAnswers Tool (placeholder)
+GetAnswers Tool
 
 Purpose:
 - Answer questions about the bookstore’s current books (availability, prices, sales, etc.)
 
 Note:
 - Now implemented for title-based questions against `storedata.json`.
+
+LangChain note (why `@tool`?)
+-----------------------------
+The `@tool` decorator turns a normal Python function into a LangChain "Tool" object.
+That object can be:
+- called directly by Python (via `.invoke({...})`)
+- or (later) exposed to an agent/LLM that decides when to call it.
+
+This project currently calls tools directly (no LLM agent loop yet).
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +31,7 @@ from tools.storedata_utils import load_store_books as _load_store_books
 from tools.storedata_utils import norm as _norm_shared
 
 def _load_storedata() -> list[dict[str, Any]]:
+    # Centralized inventory loader with caching lives in `tools/storedata_utils.py`.
     return _load_store_books()
 
 
@@ -32,11 +41,15 @@ def _norm(s: str) -> str:
 
 def _find_books_by_title(user_query: str) -> list[dict[str, Any]]:
     """
-    Find the best matching book by detecting a title mention in the user's query.
+    Find matching book(s) by detecting a title mention in the user's query.
 
     Strategy (simple + robust):
     - Normalize query and titles (lowercase, strip punctuation)
     - Choose the *longest* title that appears as a substring in the query
+
+    Why "longest title wins"?
+    - It reduces false positives when one title is contained in another.
+    - It keeps this tool deterministic without requiring embeddings or search infrastructure.
     """
     qn = _norm(user_query)
     best_len = 0
@@ -184,6 +197,8 @@ def _book_view(book: dict[str, Any]) -> _BookView:
 
 
 def _compose_response(user_query: str, b: _BookView) -> str:
+    # This tool tries to be conversational while still being "query-responsive":
+    # if the user asks for price, lead with price; if they ask for pages, answer pages, etc.
     requested = _extract_requested_fields(user_query)
 
     asked_price = "price" in requested
@@ -356,7 +371,23 @@ def _compose_response(user_query: str, b: _BookView) -> str:
 
 @tool
 def get_answers(query: str) -> str:
-    """Answer questions about the bookstore’s current books by title."""
+    """
+    Answer questions about the bookstore’s current books by title.
+
+    Input contract
+    --------------
+    - `query`: the user’s natural-language question.
+
+    Output contract
+    ---------------
+    - Returns a plain English string suitable to show directly to the user.
+
+    How it's called in this repo
+    ----------------------------
+    In `rightbookai_agent.py` you'll see:
+    - `get_answers.invoke({"query": user_query})`
+    because LangChain tools are invoked with a dict keyed by parameter name.
+    """
     books = _find_books_by_title(query)
     if not books:
         return (

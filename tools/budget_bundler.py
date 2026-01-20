@@ -6,6 +6,14 @@ Purpose:
 
 Note:
 - Uses a knapsack-style dynamic programming solver (in cents) to maximize bundle size under budget.
+
+How to think about this tool
+----------------------------
+This tool demonstrates a classic "agent tool" pattern:
+- parse constraints (budget, genres, "recent", etc.)
+- filter candidates from a structured dataset
+- run an optimization algorithm
+- return a human-readable receipt-style answer
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from tools.storedata_utils import BookView, book_view, effective_price, fmt_mone
 
 @dataclass(frozen=True)
 class _BundlePrefs:
+    # Parsed preferences for bundle building.
     budget: float
     genres: tuple[str, ...]
     require_genre_mix: bool
@@ -38,6 +47,8 @@ def _current_year() -> int:
 
 
 def _extract_budget(user_request: str) -> float | None:
+    # We keep budget parsing conservative so random numbers (like page counts)
+    # aren't mistaken for money.
     q = user_request.lower()
     # Prefer $ amounts
     m = re.search(r"\$\s*(\d+(?:\.\d+)?)", q)
@@ -93,6 +104,7 @@ def _extract_genres(user_request: str, known_genres: list[str]) -> tuple[str, ..
 
 
 def _extract_recent_and_years(user_request: str) -> tuple[bool, int | None, int | None]:
+    # Convert "recent/new/modern" into a year window, or parse explicit ranges.
     q = user_request.lower()
     cy = _current_year()
     if "recent" in q or "new" in q or "newer" in q or "modern" in q:
@@ -158,11 +170,13 @@ def _extract_popularity(user_request: str) -> str | None:
 
 
 def _wants_mix(user_request: str) -> bool:
+    # "Mix" means the user wants variety across genres (when multiple genres are specified).
     q = user_request.lower()
     return any(k in q for k in ["mix of", "mix", "variety", "one of each", "a range of"])
 
 
 def _price_cents(b: BookView) -> int | None:
+    # Optimization is easier with integers; convert dollars to cents.
     p = effective_price(b)
     if p is None:
         return None
@@ -177,6 +191,8 @@ def _median(nums: list[int]) -> int:
 
 
 def _filter_candidates(books: list[BookView], prefs: _BundlePrefs) -> list[BookView]:
+    # Apply the user's constraints to the inventory.
+    # This is "hard filtering": if a constraint is specified, we enforce it.
     out: list[BookView] = []
     review_counts = [b.review_count for b in books if isinstance(b.review_count, int)]
     median_reviews = _median([int(x) for x in review_counts if x is not None])
@@ -220,6 +236,12 @@ def _solve_bundle_max_books(
     """
     0/1 knapsack with optional required-genre coverage.
     Objective: maximize (book_count, total_spend) under budget.
+
+    Why knapsack?
+    - We want to pick a *set* of books with prices that must stay under a budget.
+    - Each book can be picked at most once (0/1).
+    - The objective is "as many books as possible", with a tie-breaker of spending more
+      (so we don't leave lots of budget unused when book counts are equal).
     """
     # Map required genres to mask bits
     genre_to_bit = {g: (1 << i) for i, g in enumerate(required_genres)}
@@ -306,7 +328,22 @@ def _solve_bundle_max_books(
 
 @tool
 def budget_bundler(budget_request: str) -> str:
-    """Assemble a suggested book order within a stated budget."""
+    """
+    Assemble a suggested book order within a stated budget.
+
+    Input contract
+    --------------
+    - `budget_request`: user's natural language request including a budget (e.g. "$65")
+
+    Output contract
+    ---------------
+    - A multi-line string listing selected titles + an order total.
+
+    Calling convention
+    ------------------
+    This is a LangChain tool, so it is invoked like:
+    - `budget_bundler.invoke({"budget_request": "..."})`
+    """
     budget = _extract_budget(budget_request)
     if budget is None or budget <= 0:
         return "Please tell me your budget (e.g., '$65') and what kinds of books you'd like."

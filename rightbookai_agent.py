@@ -1,14 +1,34 @@
 """
-RightBookAI (initial agent)
+RightBookAI (starter "agent")
 
-Current behavior:
-- Routes the user's question directly to the LLM (no tools / no retrieval yet).
+This repo is intentionally written as a *teachable* first step toward a LangChain agent.
 
-Prereqs:
-- Set OPENAI_API_KEY (supports loading from .env.local / .env)
-- Optional: set RIGHTBOOKAI_MODEL to override the model name
+Important vocabulary (LangChain / "agent-y" systems)
+---------------------------------------------------
+- **Model**: an LLM client (OpenAI, etc.) that can generate text given messages.
+- **Tool**: a normal Python function wrapped for LLM/agent use (LangChain's `@tool`).
+- **Agent**: typically an LLM that can decide *when* to call tools, observe results, and iterate.
+  This repo uses a real LangChain agent (`create_agent`) to choose tools.
+
+How this file is used
+---------------------
+- It provides a tiny CLI so you can ask questions like:
+  - "Do you have The Great Gatsby?"
+  - "Recommend 3 post-apocalyptic sci-fi books under $20"
+  - "I have a budget of $65; build me a bundle"
+- The LangChain agent created via `create_agent` decides which tool(s) to call.
+- Each tool reads from `storedata.json` via helpers in `tools/storedata_utils.py`.
+
+Current behavior (two modes)
+----------------------------
+- `rightbookai_answer(...)`: uses a real agent via `create_agent` (agent controls tool routing).
+
+Prereqs
+-------
+- Set `OPENAI_API_KEY` (supports loading from `.env.local` / `.env`)
+- Optional: set `RIGHTBOOKAI_MODEL` to override the model name
 - Install deps:
-  pip install -U "langchain[openai]"
+  `pip install -U "langchain[openai]" python-dotenv colorama`
 """
 
 from __future__ import annotations
@@ -16,15 +36,11 @@ from __future__ import annotations
 import os
 import sys
 import textwrap
+from functools import lru_cache
 from typing import Final
 
-from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
 from dotenv import load_dotenv
-
-try:
-    from openai import NotFoundError as OpenAINotFoundError
-except Exception:  # pragma: no cover
-    OpenAINotFoundError = None  # type: ignore[assignment]
 
 from tools.budget_bundler import budget_bundler
 from tools.get_answers import get_answers
@@ -36,48 +52,22 @@ SYSTEM_PROMPT: Final[str] = (
     "Be polished, warm, and precise. "
     "You help customers navigate our bookstore by answering questions about available books, "
     "making tailored recommendations, and assembling suggested orders within a stated budget and interests. "
-    "Ask brief clarifying questions when needed, and present options with clear reasoning and prices when relevant."
+    "Ask brief clarifying questions when needed, and present options with clear reasoning and prices when relevant. "
+    "\n\n"
+    "Tool usage rules (MANDATORY):\n"
+    "- You MUST call at least one tool before answering any user message.\n"
+    "- For questions about a specific title's details (genre/author/pages/price/year/sale/availability), call GetAnswers.\n"
+    "- For 'recommend/suggest/next read/similar to' requests, call RecommendBooks.\n"
+    "- For budgets or 'build a bundle', call BudgetBundler.\n"
+    "- Do not answer from general knowledge or guess; use the tool output as the source of truth.\n"
+    "- If the relevant tool can't find a title, say so and ask a brief clarifying question.\n"
 )
 MODEL_NAME: Final[str] = "gpt-5-nano"
 
-
-def choose_tool_name(user_query: str) -> str:
-    """
-    Heuristic router (placeholder).
-
-    Returns one of: "GetAnswers" | "RecommendBooks" | "BudgetBundler"
-    """
-    q = user_query.lower()
-    if any(k in q for k in ["budget", "$", "under ", "within ", "spend", "dollars"]):
-        return "BudgetBundler"
-    if any(
-        k in q
-        for k in [
-            "recommend",
-            "suggest",
-            "what should i read",
-            "similar to",
-            "next read",
-        ]
-    ):
-        return "RecommendBooks"
-    return "GetAnswers"
-
-
-def rightbookai_route_to_tool_placeholder(user_query: str) -> str:
-    """Return the placeholder response for whichever tool would be used."""
-    _, result = rightbookai_route_to_tool_placeholder_with_meta(user_query)
-    return result
-
-
-def rightbookai_route_to_tool_placeholder_with_meta(user_query: str) -> tuple[str, str]:
-    """Return (tool_name, result) for the placeholder tool router."""
-    tool_name = choose_tool_name(user_query)
-    if tool_name == "BudgetBundler":
-        return tool_name, budget_bundler.invoke({"budget_request": user_query})
-    if tool_name == "RecommendBooks":
-        return tool_name, recommend_books.invoke({"user_request": user_query})
-    return tool_name, get_answers.invoke({"query": user_query})
+# All LangChain tools exposed to the agent.
+# Note: `tools/storedata_utils.py` is intentionally *not* included because it provides
+# helper functions for reading/normalizing inventory; it's not a user-facing tool.
+TOOLS: Final[list[object]] = [get_answers, recommend_books, budget_bundler]
 
 def _load_env() -> None:
     """
@@ -88,41 +78,140 @@ def _load_env() -> None:
     - .env.local
     - .env
     """
-    # Don't override already-set environment variables.
+    # Don't override already-set environment variables (useful for CI / Docker / shells).
     load_dotenv(".env.local", override=False)
     load_dotenv(".env", override=False)
 
+def _extract_agent_text(result: object) -> str:
+    """
+    Extract a human-readable assistant response from `agent.invoke(...)`.
 
-def rightbookai_answer(question: str) -> str:
-    """Answer a user question (placeholder tool routing only)."""
-    return rightbookai_route_to_tool_placeholder(question)
+    `create_agent` returns an agent runnable whose output is typically a dict
+    containing a `messages` list, but we keep this defensive to avoid tight
+    coupling to internal return shapes.
+    """
+    if isinstance(result, dict):
+        msgs = result.get("messages")
+        if isinstance(msgs, list) and msgs:
+            last = msgs[-1]
+            if isinstance(last, dict):
+                c = last.get("content")
+                if isinstance(c, str):
+                    return c
+            # LangChain message objects often have `.content`
+            content = getattr(last, "content", None)
+            if isinstance(content, str):
+                return content
+            return str(last)
+        out = result.get("output")
+        if isinstance(out, str):
+            return out
+    # Fallback: stringify whatever we got.
+    return str(result)
+
+def _extract_agent_tool_names(result: object) -> list[str]:
+    """
+    Extract tool names used during the agent run from `agent.invoke(...)` output.
+
+    We look for tool call metadata on AI messages (tool_calls) and tool result messages.
+    This is intentionally defensive across LangChain versions / message shapes.
+    """
+    msgs: list[object] = []
+    if isinstance(result, dict):
+        raw = result.get("messages")
+        if isinstance(raw, list):
+            msgs = raw
+
+    used: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: object) -> None:
+        if not isinstance(name, str):
+            return
+        n = name.strip()
+        if not n or n in seen:
+            return
+        seen.add(n)
+        used.append(n)
+
+    for m in msgs:
+        # Dict-style messages (sometimes returned when using JSON-ish messages)
+        if isinstance(m, dict):
+            # Tool call list on assistant message
+            tc = m.get("tool_calls")
+            if isinstance(tc, list):
+                for call in tc:
+                    if isinstance(call, dict):
+                        add(call.get("name"))
+            # Tool result message may include a name
+            if m.get("role") == "tool":
+                add(m.get("name"))
+            continue
+
+        # Object-style messages (LangChain BaseMessage variants)
+        tool_calls = getattr(m, "tool_calls", None)
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    add(call.get("name"))
+                else:
+                    add(getattr(call, "name", None))
+
+        # ToolMessage often has `.name`
+        add(getattr(m, "name", None))
+
+    return used
 
 
-def rightbookai_answer_via_llm(question: str) -> str:
-    """Route a user question directly to the LLM (no tools / no retrieval)."""
+@lru_cache(maxsize=1)
+def _rightbookai_agent():
+    """
+    Create and cache the LangChain agent.
+
+    We cache it because:
+    - agent construction can be non-trivial (model initialization, tool wiring)
+    - the CLI can call it repeatedly in REPL mode
+    """
     _load_env()
     if not os.environ.get("OPENAI_API_KEY"):
         raise SystemExit(
-            "Missing OPENAI_API_KEY. Set it in the environment or in .env.local, then re-run."
+            "Missing OPENAI_API_KEY. Set it in the environment or in .env.local, then re-run.\n"
+            "This project uses a LangChain agent (`create_agent`) for tool routing."
         )
+
     model_name = os.environ.get("RIGHTBOOKAI_MODEL", MODEL_NAME)
-    model = init_chat_model(model=model_name, model_provider="openai")
-    try:
-        ai_msg = model.invoke(
-            [
-                ("system", SYSTEM_PROMPT),
-                ("human", question),
-            ]
-        )
-    except Exception as e:
-        # Provide a clearer message for the common "model not found / no access" case.
-        if OpenAINotFoundError is not None and isinstance(e, OpenAINotFoundError):
-            raise SystemExit(
-                f"Model '{model_name}' was not found or your API key doesn't have access.\n"
-                f"Set RIGHTBOOKAI_MODEL in .env.local to a model you have access to (e.g. gpt-4.1-mini), then re-run."
-            ) from e
-        raise
-    return ai_msg.text
+
+    # LangChain's `create_agent` wires a model + tools into an agent loop that can decide
+    # when to call which tool. This is the "real agent" path described in the docs.
+    #
+    # Ref: https://docs.langchain.com/oss/python/langchain/overview
+    return create_agent(
+        model=model_name,
+        tools=TOOLS,
+        system_prompt=SYSTEM_PROMPT,
+    )
+
+
+def rightbookai_answer_via_agent(question: str) -> str:
+    """Answer a user question using a LangChain agent created via `create_agent`."""
+    agent = _rightbookai_agent()
+    result = agent.invoke({"messages": [{"role": "user", "content": question}]})
+    return _extract_agent_text(result)
+
+def rightbookai_answer_via_agent_with_meta(question: str) -> tuple[list[str], str]:
+    """Return (tool_names_used, response_text) for a user question via the agent."""
+    agent = _rightbookai_agent()
+    result = agent.invoke({"messages": [{"role": "user", "content": question}]})
+    return _extract_agent_tool_names(result), _extract_agent_text(result)
+
+
+def rightbookai_answer(question: str) -> str:
+    """
+    Answer a user question via the LangChain agent.
+
+    The agent (LLM) controls tool selection/routing.
+    """
+    return rightbookai_answer_via_agent(question)
 
 
 def _read_question_from_cli(argv: list[str]) -> str:
@@ -207,7 +296,8 @@ if __name__ == "__main__":
             question = _read_question_from_cli(sys.argv)
             if not question or question.lower() in {"exit", "quit"}:
                 raise SystemExit(0)
-            tool_name, result = rightbookai_route_to_tool_placeholder_with_meta(question)
+            tools_used, result = rightbookai_answer_via_agent_with_meta(question)
+            tool_name = " + ".join(tools_used) if tools_used else "Agent (create_agent; no tool calls detected)"
             print(_format_cli_output(question=question, tool_name=tool_name, response=result))
         raise SystemExit(0)
 
@@ -215,6 +305,7 @@ if __name__ == "__main__":
     question = _read_question_from_cli(sys.argv)
     if not question:
         raise SystemExit("Provide a question as args or via stdin.")
-    tool_name, result = rightbookai_route_to_tool_placeholder_with_meta(question)
+    tools_used, result = rightbookai_answer_via_agent_with_meta(question)
+    tool_name = " + ".join(tools_used) if tools_used else "Agent (create_agent; no tool calls detected)"
     print(_format_cli_output(question=question, tool_name=tool_name, response=result))
 

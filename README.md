@@ -58,7 +58,7 @@ RIGHTBOOKAI_MODEL=gpt-4.1-mini
 ```
 
 Notes:
-- **`OPENAI_API_KEY`** is required only for `rightbookai_answer_via_llm` (LLM-only mode).
+- **`OPENAI_API_KEY`** is required for the CLI, because routing is controlled by a LangChain agent (`create_agent`).
 - **`RIGHTBOOKAI_MODEL`** is optional. If you omit it, the code uses its default model name.
 - `.env.local` is loaded automatically by `rightbookai_agent.py`.
 
@@ -106,10 +106,8 @@ python -c \"from tools.budget_bundler import budget_bundler; print(budget_bundle
 
 ## How routing works
 
-`rightbookai_agent.py` uses a simple heuristic router:
-- Budget-ish queries → **BudgetBundler**
-- “recommend/suggest/next read” queries → **RecommendBooks**
-- Everything else → **GetAnswers**
+`rightbookai_agent.py` uses a LangChain agent created with `create_agent`,
+which decides when to call the available tools (see the LangChain overview docs).
 
-The router is deliberately simple; the heavy lifting is done inside each tool.
+The heavy lifting is done inside each tool; the agent decides which tool(s) to call.
 
