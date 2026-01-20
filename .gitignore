@@ -18,6 +18,10 @@ package-lock.json
 .cursorindexingignore
 .specstory/
 
+# Python virtual environments
+.venv/
+venv/
+
 # OS
 .DS_Store
 Thumbs.db
